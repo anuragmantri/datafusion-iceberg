@@ -562,9 +562,11 @@ fn lex_ordering(
 }
 
 /// Whether DataFusion orders values of `field_type` as the engines that write
-/// sorted Iceberg files do. It orders -0.0 before 0.0 and negative NaN before
-/// every number, where Spark treats the zeros as equal and NaN as the largest
-/// value, and the Iceberg spec leaves the order of UUIDs undefined
+/// sorted Iceberg files do. For floating point, DataFusion uses the order the
+/// spec defines (<https://iceberg.apache.org/spec/#sort-orders>), with -0.0
+/// before 0.0 and negative NaN first. Spark treats the zeros as equal and
+/// every NaN as the largest value, so files it writes may not be sorted in the
+/// spec's order. The spec leaves the order of UUIDs undefined
 /// (apache/iceberg#14216).
 fn orders_like_writers(field_type: &Type) -> bool {
     matches!(

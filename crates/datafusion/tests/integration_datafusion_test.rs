@@ -44,6 +44,7 @@ use datafusion::physical_plan::common::collect;
 use datafusion::physical_plan::joins::SortMergeJoinExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
+use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -1621,6 +1622,43 @@ async fn test_sorted_scan_merges_files_with_overlapping_ranges()
             &[id, -id]
         );
     }
+    Ok(())
+}
+
+/// Each file holds more rows than a reader batch, so the merge advances every
+/// per-file stream across batch boundaries, where the order within a stream
+/// comes from the reader rather than the merge.
+#[tokio::test]
+async fn test_sorted_scan_merges_files_longer_than_a_batch() -> Result<(), Box<dyn Error>>
+{
+    let (catalog, namespace) = sorted_namespace().await?;
+    let evens: Vec<i32> = (0..6000).step_by(2).collect();
+    let odds: Vec<i32> = (1..6000).step_by(2).collect();
+    let table = create_sorted_table(
+        &catalog,
+        &namespace,
+        "t",
+        &[(SORTED, &evens), (SORTED, &odds)],
+    )
+    .await?;
+    let ctx = ordering_session(true, 4).await?;
+    let plan = plan_sorted_scan(&table, &ctx).await?;
+    let scan = iceberg_source(&plan).unwrap();
+
+    for task in scan.sorted_tasks().unwrap() {
+        let batches: Vec<RecordBatch> = table
+            .reader_builder()
+            .build()
+            .read(futures::stream::iter([Ok(task.clone())]).boxed())?
+            .stream()
+            .try_collect()
+            .await?;
+        assert!(batches.len() > 1, "{}", task.data_file_path());
+    }
+    assert_eq!(
+        ids(&run_batches(plan.as_ref(), &ctx).await?),
+        (0..6000).collect::<Vec<_>>()
+    );
     Ok(())
 }
 
