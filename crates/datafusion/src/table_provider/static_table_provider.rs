@@ -120,7 +120,7 @@ impl TableProvider for IcebergStaticTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -131,7 +131,9 @@ impl TableProvider for IcebergStaticTableProvider {
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(limit)
-            .build()?;
+            .build()?
+            .plan_sort_order(state)
+            .await?;
         Ok(DataSourceExec::from_data_source(source))
     }
 
