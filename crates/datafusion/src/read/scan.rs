@@ -86,7 +86,20 @@ impl IcebergDataSource {
     /// Starts building a source that scans `table` and returns the columns of
     /// `schema`, all of them unless [`IcebergDataSourceBuilder::with_projection`]
     /// selects some. Columns are read from Iceberg by name.
-    pub fn builder(table: Table, schema: ArrowSchemaRef) -> IcebergDataSourceBuilder {
+    ///
+    /// `sorted_tasks` are the data files to merge in the sort order they all
+    /// record, which the source then reports to DataFusion. With `None`, the
+    /// source lists its files when it runs and reports no order, as a table
+    /// provider's source does. A source rebuilt from another, such as in
+    /// another process, must be given what that source's
+    /// [`sorted_tasks`](Self::sorted_tasks) returns, because a plan built over a
+    /// sorted source may rely on its order. [`IcebergDataSourceBuilder::build`]
+    /// fails if the tasks don't share a sort order the source can report.
+    pub fn builder(
+        table: Table,
+        schema: ArrowSchemaRef,
+        sorted_tasks: Option<Vec<FileScanTask>>,
+    ) -> IcebergDataSourceBuilder {
         IcebergDataSourceBuilder {
             table,
             schema,
@@ -94,7 +107,7 @@ impl IcebergDataSource {
             snapshot_id: None,
             predicate: None,
             fetch: None,
-            sorted_tasks: None,
+            sorted_tasks,
         }
     }
 
@@ -237,8 +250,9 @@ impl IcebergDataSource {
 ///
 /// A table provider passes the table's schema and selects columns with
 /// [`Self::with_projection`]. To rebuild a source, such as in another process,
-/// pass its [`IcebergDataSource::schema`], which is already projected, no
-/// projection, and its [`IcebergDataSource::sorted_tasks`].
+/// pass its [`IcebergDataSource::schema`], which is already projected, and its
+/// [`IcebergDataSource::sorted_tasks`] to [`IcebergDataSource::builder`], and no
+/// projection.
 #[derive(Debug, Clone)]
 pub struct IcebergDataSourceBuilder {
     table: Table,
@@ -281,16 +295,6 @@ impl IcebergDataSourceBuilder {
     /// Stops after `fetch` rows, or reads every row if `None` (the default).
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
-        self
-    }
-
-    /// Merges these data files in the sort order they all record, which the
-    /// source then reports to DataFusion, or lists the files when the source
-    /// runs and reports no order if `None` (the default). A plan built over a
-    /// source with [`IcebergDataSource::sorted_tasks`] may rely on their order,
-    /// so a source rebuilt from it must be given them.
-    pub fn with_sorted_tasks(mut self, sorted_tasks: Option<Vec<FileScanTask>>) -> Self {
-        self.sorted_tasks = sorted_tasks;
         self
     }
 

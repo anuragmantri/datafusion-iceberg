@@ -939,11 +939,10 @@ fn rebuild_scan_with_tasks(
     scan: &IcebergDataSource,
     sorted_tasks: Option<Vec<FileScanTask>>,
 ) -> datafusion::error::Result<IcebergDataSource> {
-    IcebergDataSource::builder(scan.table().clone(), scan.schema())
+    IcebergDataSource::builder(scan.table().clone(), scan.schema(), sorted_tasks)
         .with_snapshot_id(scan.snapshot_id())
         .with_predicate(scan.predicate().cloned())
         .with_fetch(scan.fetch())
-        .with_sorted_tasks(sorted_tasks)
         .build()
 }
 
@@ -1106,7 +1105,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     // A scan reads the columns of its schema and no others, so one built over
     // part of the table returns only those columns, from the pinned snapshot.
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
-    let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
+    let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only, None)
         .with_snapshot_id(Some(snapshot_id))
         .build()?;
     insta::assert_snapshot!(&run_source(&partial, &ctx).await?, @r#"
@@ -1888,6 +1887,12 @@ async fn test_rebuilt_sorted_scan_keeps_order() -> Result<(), Box<dyn Error>> {
         ids(&run_batches(rebuilt.as_ref(), &ctx).await?),
         vec![1, 2, 3, 4]
     );
+
+    // Without the tasks a rebuilt source lists its files when it runs, and
+    // reports no order.
+    let unsorted = rebuild_scan_with_tasks(scan, None)?;
+    assert!(unsorted.sorted_tasks().is_none());
+    assert!(unsorted.eq_properties().output_ordering().is_none());
 
     assert!(rebuild_scan_with_tasks(scan, Some(vec![])).is_err());
     Ok(())
