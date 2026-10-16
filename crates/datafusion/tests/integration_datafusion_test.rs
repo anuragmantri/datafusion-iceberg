@@ -51,8 +51,8 @@ use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::scan::{FileScanTask, FileScanTaskDeleteFile};
 use iceberg::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, ListType, Literal, NestedField,
-    NullOrder, PrimitiveType, Schema, SortDirection, SortField, SortOrder, Struct,
-    StructType, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
+    NullOrder, PrimitiveType, Schema, SortDirection, SortField, SortOrder, SortOrderRef,
+    Struct, StructType, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
@@ -1513,7 +1513,7 @@ fn nullable_ids(batches: &[RecordBatch]) -> Vec<Option<i32>> {
 }
 
 /// A session that registers the Iceberg options, with
-/// `iceberg.planning.preserve_data_ordering` set to `preserve`.
+/// `iceberg.execution.preserve_data_ordering` set to `preserve`.
 async fn ordering_session(
     preserve: bool,
     target_partitions: usize,
@@ -1523,7 +1523,7 @@ async fn ordering_session(
         .with_option_extension(IcebergDataFusionConfig::default());
     let ctx = SessionContext::new_with_config(config);
     ctx.sql(&format!(
-        "SET iceberg.planning.preserve_data_ordering = {preserve}"
+        "SET iceberg.execution.preserve_data_ordering = {preserve}"
     ))
     .await?
     .collect()
@@ -1751,7 +1751,7 @@ async fn test_sorted_scan_is_opt_in_and_capped() -> Result<(), Box<dyn Error>> {
 
     let capped = ordering_session(true, 4).await?;
     capped
-        .sql("SET iceberg.planning.max_merge_files = 2")
+        .sql("SET iceberg.execution.max_merge_files_per_partition = 2")
         .await?
         .collect()
         .await?;
@@ -1759,7 +1759,7 @@ async fn test_sorted_scan_is_opt_in_and_capped() -> Result<(), Box<dyn Error>> {
     assert!(plan.properties().output_ordering().is_none());
 
     capped
-        .sql("SET iceberg.planning.max_merge_files = 3")
+        .sql("SET iceberg.execution.max_merge_files_per_partition = 3")
         .await?
         .collect()
         .await?;
@@ -1898,10 +1898,11 @@ async fn test_rebuilt_sorted_scan_keeps_order() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Returns `task` with `deletes` attached.
-fn with_deletes(
+/// Returns a copy of `task` with `deletes` and `sort_order` in place of its own.
+fn copy_task(
     task: &FileScanTask,
     deletes: Vec<FileScanTaskDeleteFile>,
+    sort_order: Option<SortOrderRef>,
 ) -> Result<FileScanTask, Box<dyn Error>> {
     Ok(FileScanTask::builder()
         .with_file_size_in_bytes(task.file_size_in_bytes())
@@ -1918,7 +1919,7 @@ fn with_deletes(
         .with_partition_spec(task.partition_spec().cloned())
         .with_name_mapping(task.name_mapping().cloned())
         .with_sort_order_id(task.sort_order_id())
-        .with_sort_order(task.sort_order().cloned())
+        .with_sort_order(sort_order)
         .with_case_sensitive(task.case_sensitive())
         .build()?)
 }
@@ -1974,7 +1975,7 @@ async fn test_sorted_scan_applies_position_deletes() -> Result<(), Box<dyn Error
         .build()?;
     let tasks = tasks
         .iter()
-        .map(|task| with_deletes(task, vec![delete.clone()]))
+        .map(|task| copy_task(task, vec![delete.clone()], task.sort_order().cloned()))
         .collect::<Result<Vec<_>, _>>()?;
 
     let rebuilt =
@@ -2109,5 +2110,75 @@ async fn test_sorted_scan_on_nullable_key() -> Result<(), Box<dyn Error>> {
             datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
         assert_eq!(nullable_ids(&batches), expected, "{sql}");
     }
+    Ok(())
+}
+
+/// A sorted scan of one file reports its order and returns its rows without a
+/// merge, and a scan of a sorted table with no files reports no order.
+#[tokio::test]
+async fn test_sorted_scan_of_one_file_and_of_no_files() -> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let ctx = ordering_session(true, 4).await?;
+
+    let one =
+        create_sorted_table(&catalog, &namespace, "one", &[(SORTED, &[1, 2, 3])]).await?;
+    let plan = plan_sorted_scan(&one, &ctx).await?;
+    assert_eq!(
+        iceberg_source(&plan)
+            .unwrap()
+            .sorted_tasks()
+            .map(<[_]>::len),
+        Some(1)
+    );
+    assert_eq!(
+        plan.properties()
+            .output_ordering()
+            .map(|ordering| ordering.to_string()),
+        Some("id@0 ASC".to_string())
+    );
+    assert_eq!(ids(&run_batches(plan.as_ref(), &ctx).await?), vec![1, 2, 3]);
+
+    let empty = create_sorted_table(&catalog, &namespace, "empty", &[]).await?;
+    let plan = plan_sorted_scan(&empty, &ctx).await?;
+    assert!(iceberg_source(&plan).unwrap().sorted_tasks().is_none());
+    assert!(plan.properties().output_ordering().is_none());
+    assert!(ids(&run_batches(plan.as_ref(), &ctx).await?).is_empty());
+    Ok(())
+}
+
+/// Tasks given to the builder must all record the same sort order, not only
+/// the same sort order id, because the merge uses one order for all of them.
+#[tokio::test]
+async fn test_rebuilt_sorted_scan_rejects_tasks_with_different_orders()
+-> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(
+        &catalog,
+        &namespace,
+        "t",
+        &[(SORTED, &[1, 3]), (SORTED, &[2, 4])],
+    )
+    .await?;
+    let ctx = ordering_session(true, 4).await?;
+    let plan = plan_sorted_scan(&table, &ctx).await?;
+    let scan = iceberg_source(&plan).unwrap();
+    let mut tasks = scan.sorted_tasks().unwrap().to_vec();
+
+    let descending = SortOrder::builder()
+        .with_order_id(1)
+        .with_sort_field(
+            SortField::builder()
+                .source_id(1)
+                .transform(Transform::Identity)
+                .direction(SortDirection::Descending)
+                .null_order(NullOrder::Last)
+                .build(),
+        )
+        .build_unbound()?;
+    tasks[1] = copy_task(&tasks[1], vec![], Some(Arc::new(descending)))?;
+    assert_eq!(tasks[1].sort_order_id(), tasks[0].sort_order_id());
+    assert_ne!(tasks[1].sort_order(), tasks[0].sort_order());
+
+    assert!(rebuild_scan_with_tasks(scan, Some(tasks)).is_err());
     Ok(())
 }

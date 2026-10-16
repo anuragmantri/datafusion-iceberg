@@ -143,7 +143,7 @@ impl IcebergDataSource {
     }
 
     /// Lists the source's data files and reports the sort order they all
-    /// record, if the session enables `iceberg.planning.preserve_data_ordering`
+    /// record, if the session enables `iceberg.execution.preserve_data_ordering`
     /// and they are few enough to merge. Otherwise returns the source unchanged.
     pub(crate) async fn plan_sort_order(self, state: &dyn Session) -> Result<Self> {
         let config = state
@@ -151,7 +151,7 @@ impl IcebergDataSource {
             .options()
             .extensions
             .get::<IcebergDataFusionConfig>()
-            .map(|config| config.planning.clone())
+            .map(|config| config.execution.clone())
             .unwrap_or_default();
         if !config.preserve_data_ordering {
             return Ok(self);
@@ -183,11 +183,11 @@ impl IcebergDataSource {
         .plan_files()
         .await
         .map_err(to_datafusion_error)?
-        .take(config.max_merge_files.saturating_add(1))
+        .take(config.max_merge_files_per_partition.saturating_add(1))
         .try_collect()
         .await
         .map_err(to_datafusion_error)?;
-        if tasks.len() > config.max_merge_files {
+        if tasks.len() > config.max_merge_files_per_partition {
             return Ok(self);
         }
         let mut source = self;
@@ -509,9 +509,7 @@ fn build_table_scan(
 fn shared_ordering(tasks: &[FileScanTask], output: &ArrowSchema) -> Option<LexOrdering> {
     let first = tasks.first()?;
     let order = first.sort_order()?;
-    if !tasks.iter().all(|task| {
-        task.sort_order_id() == first.sort_order_id() && task.sort_order().is_some()
-    }) {
+    if !tasks.iter().all(|task| task.sort_order() == Some(order)) {
         return None;
     }
     if !reads_as_declared(first.schema(), output) {

@@ -28,16 +28,39 @@ extensions_options! {
     /// [`SessionConfig::with_option_extension`](datafusion::prelude::SessionConfig::with_option_extension).
     /// Without it, every option keeps its default. DataFusion lists these
     /// options in `information_schema.df_settings` by their last name alone,
-    /// such as `max_merge_files`, and `SHOW` and `RESET` do not support them.
+    /// such as `max_merge_files_per_partition`, and `SHOW` and `RESET` do not
+    /// support them.
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> datafusion::error::Result<()> {
+    /// use datafusion::prelude::{SessionConfig, SessionContext};
+    /// use iceberg_datafusion::IcebergDataFusionConfig;
+    ///
+    /// let config =
+    ///     SessionConfig::new().with_option_extension(IcebergDataFusionConfig::default());
+    /// let ctx = SessionContext::new_with_config(config);
+    /// ctx.sql("SET iceberg.execution.preserve_data_ordering = true")
+    ///     .await?
+    ///     .collect()
+    ///     .await?;
+    ///
+    /// let state = ctx.state();
+    /// let options = state.config().options();
+    /// let iceberg = options.extensions.get::<IcebergDataFusionConfig>().unwrap();
+    /// assert!(iceberg.execution.preserve_data_ordering);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub struct IcebergDataFusionConfig {
-        /// Options for planning table scans.
-        pub planning: IcebergPlanningConfig, default = IcebergPlanningConfig::default()
+        /// Options for executing table scans.
+        pub execution: IcebergExecutionConfig, default = IcebergExecutionConfig::default()
     }
 }
 
 extensions_options! {
-    /// Options for planning Iceberg table scans, under `iceberg.planning`.
-    pub struct IcebergPlanningConfig {
+    /// Options for executing Iceberg table scans, under `iceberg.execution`.
+    pub struct IcebergExecutionConfig {
         /// When true, a scan lists its data files while it is planned and, if
         /// every file records the same sort order, reports that order to
         /// DataFusion so that it can skip sorting the scan's output. The scan
@@ -48,16 +71,19 @@ extensions_options! {
         /// floating point or UUID field, whose orders in Iceberg writers and in
         /// DataFusion can differ.
         ///
-        /// Iceberg sorts ascending fields with nulls first by default, while
-        /// DataFusion's `ORDER BY c` puts them last. On a nullable sort column,
+        /// The scan reports each sort field's null order as the table declares
+        /// it. Writers commonly sort ascending fields with nulls first, the
+        /// default of Iceberg Java's `SortOrderBuilder.asc`, while DataFusion's
+        /// `ORDER BY c` puts them last. On a nullable column sorted that way,
         /// only `ORDER BY c NULLS FIRST`, or a session with
         /// `datafusion.sql_parser.default_null_ordering = 'nulls_min'`, can
         /// skip its sort. Other queries sort the merged output again.
         pub preserve_data_ordering: bool, default = false
-        /// The most data files a scan merges to preserve their sort order.
-        /// A scan of more files reports no order, and DataFusion sorts its
-        /// output instead, which can spill to disk where the merge cannot.
-        pub max_merge_files: usize, default = 64
+        /// The most data files a scan merges in one output partition to
+        /// preserve their sort order. A scan with more files in a partition
+        /// reports no order, and DataFusion sorts its output instead, which
+        /// can spill to disk where the merge cannot.
+        pub max_merge_files_per_partition: usize, default = 64
     }
 }
 
